@@ -2,23 +2,9 @@
 
 import chalk from "chalk";
 import DomainInfo = require("./DomainInfo");
+import DomainConfig = require("./DomainConfig");
+import Globals from "./Globals";
 import { ServerlessInstance, ServerlessOptions } from "./types";
-
-const endpointTypes = {
-    edge: "EDGE",
-    regional: "REGIONAL",
-};
-
-const apiTypes = {
-    http: "HTTP",
-    rest: "REST",
-    websocket: "WEBSOCKET",
-};
-
-const tlsVersions = {
-    tls_1_0: "TLS_1_0",
-    tls_1_2: "TLS_1_2",
-};
 
 const certStatuses = ["PENDING_VALIDATION", "ISSUED", "INACTIVE"];
 
@@ -39,18 +25,14 @@ class ServerlessCustomDomain {
     public hooks: object;
 
     // Domain Manager specific properties
-    public enabled: boolean;
-    public givenDomainName: string;
-    public hostedZonePrivate: boolean;
-    public basePath: string;
-    private endpointType: string;
-    private stage: string;
-    private securityPolicy: string;
-    private apiType: string;
+    public domains: DomainConfig[] = [];
 
     constructor(serverless: ServerlessInstance, options: ServerlessOptions) {
         this.serverless = serverless;
+        Globals.serverless = serverless;
+
         this.options = options;
+        Globals.options = options;
 
         this.commands = {
             create_domain: {
@@ -69,11 +51,11 @@ class ServerlessCustomDomain {
             },
         };
         this.hooks = {
-            "after:deploy:deploy": this.hookWrapper.bind(this, this.setupBasePathMapping),
-            "after:info:info": this.hookWrapper.bind(this, this.domainSummary),
-            "before:remove:remove": this.hookWrapper.bind(this, this.removeBasePathMapping),
-            "create_domain:create": this.hookWrapper.bind(this, this.createDomain),
-            "delete_domain:delete": this.hookWrapper.bind(this, this.deleteDomain),
+            "after:deploy:deploy": this.hookWrapper.bind(this, this.setupBasePathMappings),
+            "after:info:info": this.hookWrapper.bind(this, this.domainSummaries),
+            "before:remove:remove": this.hookWrapper.bind(this, this.removeBasePathMappings),
+            "create_domain:create": this.hookWrapper.bind(this, this.createDomains),
+            "delete_domain:delete": this.hookWrapper.bind(this, this.deleteDomains),
         };
     }
 
@@ -82,202 +64,182 @@ class ServerlessCustomDomain {
      * @param lifecycleFunc lifecycle function that actually does desired action
      */
     public async hookWrapper(lifecycleFunc: any) {
-        this.initializeVariables();
-        if (!this.enabled) {
-            this.serverless.cli.log("serverless-domain-manager: Custom domain is disabled.");
-            return;
-        } else {
-            return await lifecycleFunc.call(this);
+
+        // Make sure customDomain configuration exists, stop if not
+        if (typeof this.serverless.service.custom === "undefined"
+            || typeof this.serverless.service.custom.customDomain === "undefined") {
+            throw new Error("serverless-domain-manager: Plugin configuration is missing.");
         }
+
+        this.initializeVariables();
+
+        return await lifecycleFunc.call(this);
     }
 
     /**
      * Lifecycle function to create a domain
      * Wraps creating a domain and resource record set
      */
-    public async createDomain(): Promise<void> {
-        let domainInfo;
-        try {
-            domainInfo = await this.getDomainInfo();
-        } catch (err) {
-            if (err.message !== `Error: ${this.givenDomainName} not found.`) {
-                throw err;
+    public async createDomains(): Promise<void> {
+
+        await this.getDomainInfo();
+
+        await Promise.all(this.domains.map(async (domain) => {
+            try {
+                if (!domain.domainInfo) {
+
+                    domain.certificateArn = await this.getCertArn(domain);
+
+                    await this.createCustomDomain(domain);
+
+                    await this.changeResourceRecordSet("UPSERT", domain);
+
+                    this.serverless.cli.log(
+                        `Custom domain ${domain.givenDomainName} was created. New domains may
+                         take up to 40 minutes to be initialized.`,
+                    );
+                } else {
+                    this.serverless.cli.log(`Custom domain ${domain.givenDomainName} already exists.`);
+                }
+            } catch (err) {
+                this.logIfDebug(err, domain.givenDomainName);
+                throw new Error(`Error: Unable to craete domain ${domain.givenDomainName}`);
             }
-        }
-        if (!domainInfo) {
-            const certArn = await this.getCertArn();
-            domainInfo = await this.createCustomDomain(certArn);
-            await this.changeResourceRecordSet("UPSERT", domainInfo);
-            this.serverless.cli.log(
-                `Custom domain ${this.givenDomainName} was created.
-            New domains may take up to 40 minutes to be initialized.`,
-            );
-        } else {
-            this.serverless.cli.log(`Custom domain ${this.givenDomainName} already exists.`);
-        }
+        }));
     }
 
     /**
      * Lifecycle function to delete a domain
      * Wraps deleting a domain and resource record set
      */
-    public async deleteDomain(): Promise<void> {
-        let domainInfo;
-        try {
-            domainInfo = await this.getDomainInfo();
-        } catch (err) {
-            if (err.message === `Error: ${this.givenDomainName} not found.`) {
-                this.serverless.cli.log(`Unable to delete custom domain ${this.givenDomainName}.`);
-                return;
+    public async deleteDomains(): Promise<void> {
+
+        await this.getDomainInfo();
+
+        await Promise.all(this.domains.map(async (domain) => {
+            try {
+                if (domain.domainInfo) {
+                    await this.deleteCustomDomain(domain);
+                    await this.changeResourceRecordSet("DELETE", domain);
+                    this.serverless.cli.log(`Custom domain ${domain.givenDomainName} was deleted.`);
+                } else {
+                    this.serverless.cli.log(`Custom domain ${domain.givenDomainName} does not exists.`);
+                }
+            } catch (err) {
+                this.logIfDebug(err, domain.givenDomainName);
+                throw new Error(`Error: Unable to delete domain ${domain.givenDomainName}`);
             }
-            throw err;
-        }
-        await this.deleteCustomDomain();
-        await this.changeResourceRecordSet("DELETE", domainInfo);
-        this.serverless.cli.log(`Custom domain ${this.givenDomainName} was deleted.`);
+        }));
     }
 
     /**
      * Lifecycle function to create basepath mapping
      * Wraps creation of basepath mapping and adds domain name info as output to cloudformation stack
      */
-    public async setupBasePathMapping(): Promise<void> {
-        // check if basepathmapping exists
-        const apiId = await this.getApiId();
-        const currentBasePath = await this.getBasePathMapping(apiId);
+    public async setupBasePathMappings(): Promise<void> {
+        await Promise.all(this.domains.map(async (domain) => {
+            try {
+                domain.apiId = await this.getApiId(domain);
+                domain.currentBasePath = await this.getBasePathMapping(domain);
 
-        // if basepath that matches apiId exists, update; else, create
-        if (!currentBasePath) {
-            await this.createBasePathMapping(apiId);
-        } else {
-            await this.updateBasePathMapping(currentBasePath);
-        }
-        const domainInfo = await this.getDomainInfo();
-        this.addOutputs(domainInfo);
-        await this.printDomainSummary(domainInfo);
+                if (!domain.currentBasePath) {
+                    await this.createBasePathMapping(domain);
+                } else {
+                    await this.updateBasePathMapping(domain);
+                }
+
+                await this.getDomainInfo();
+                this.addOutputs(domain);
+                await this.printDomainSummary(domain);
+
+            } catch (err) {
+                this.logIfDebug(err, domain.givenDomainName);
+                throw new Error(`Error: Unable to setup base domain mappings for ${domain.givenDomainName}`);
+            }
+        }));
     }
 
     /**
      * Lifecycle function to delete basepath mapping
      * Wraps deletion of basepath mapping
      */
-    public async removeBasePathMapping(): Promise<void> {
-        await this.deleteBasePathMapping();
+    public async removeBasePathMappings(): Promise<void> {
+        await Promise.all(this.domains.map(async (domain) => {
+            try {
+                await this.deleteBasePathMapping(domain);
+            } catch (err) {
+                this.logIfDebug(err, domain.givenDomainName);
+                throw new Error(`Error: Unable to remove base bath mappings for domain ${domain.givenDomainName}`);
+            }
+        }));
     }
 
     /**
      * Lifecycle function to print domain summary
      * Wraps printing of all domain manager related info
      */
-    public async domainSummary(): Promise<void> {
-        const domainInfo = await this.getDomainInfo();
-        if (domainInfo) {
-            this.printDomainSummary(domainInfo);
-        } else {
-            this.serverless.cli.log("Unable to print Serverless Domain Manager Summary");
-        }
+    public async domainSummaries(): Promise<void> {
+        await this.getDomainInfo();
+
+        this.domains.forEach((domain) => {
+            if (domain.domainInfo) {
+                this.printDomainSummary(domain);
+            } else {
+                this.serverless.cli.log(
+                    `Unable to print Serverless Domain Manager Summary for ${domain.givenDomainName}`,
+                );
+            }
+        });
     }
 
     /**
      * Goes through custom domain property and initializes local variables and cloudformation template
      */
     public initializeVariables(): void {
-        this.enabled = this.evaluateEnabled();
-        if (this.enabled) {
-            const credentials = this.serverless.providers.aws.getCredentials();
-            credentials.region = this.serverless.providers.aws.getRegion();
 
-            this.serverless.providers.aws.sdk.config.update({maxRetries: 20});
-            this.apigateway = new this.serverless.providers.aws.sdk.APIGateway(credentials);
-            this.apigatewayV2 = new this.serverless.providers.aws.sdk.ApiGatewayV2(credentials);
-            this.route53 = new this.serverless.providers.aws.sdk.Route53(credentials);
-            this.cloudformation = new this.serverless.providers.aws.sdk.CloudFormation(credentials);
+        const credentials = this.serverless.providers.aws.getCredentials();
+        credentials.region = this.serverless.providers.aws.getRegion();
 
-            this.givenDomainName = this.serverless.service.custom.customDomain.domainName;
-            this.hostedZonePrivate = this.serverless.service.custom.customDomain.hostedZonePrivate;
-            let basePath = this.serverless.service.custom.customDomain.basePath;
-            if (basePath == null || basePath.trim() === "") {
-                basePath = "(none)";
+        this.serverless.providers.aws.sdk.config.update({ maxRetries: 20 });
+        this.apigateway = new this.serverless.providers.aws.sdk.APIGateway(credentials);
+        this.apigatewayV2 = new this.serverless.providers.aws.sdk.ApiGatewayV2(credentials);
+        this.route53 = new this.serverless.providers.aws.sdk.Route53(credentials);
+        this.cloudformation = new this.serverless.providers.aws.sdk.CloudFormation(credentials);
+
+        // Loop over the domain configurations and popluates the domains array with DomainConfigs
+        for (const [key] of Object.entries(this.serverless.service.custom.customDomain)) {
+
+            let dc: DomainConfig;
+
+            // Handle defined API types where key is the api type
+            if (key.toLowerCase() in Globals.apiTypes) {
+                dc = new DomainConfig(this.serverless.service.custom.customDomain[key], key);
+
+            } else { // legacy/single domain config
+                dc = new DomainConfig(this.serverless.service.custom.customDomain,
+                    this.serverless.service.custom.customDomain.apiType);
             }
-            this.basePath = basePath;
-            let stage = this.serverless.service.custom.customDomain.stage;
-            if (typeof stage === "undefined") {
-                stage = this.options.stage || this.serverless.service.provider.stage;
-            }
-            this.stage = stage;
 
-            const endpointTypeWithDefault = this.serverless.service.custom.customDomain.endpointType ||
-                endpointTypes.edge;
-            const endpointTypeToUse = endpointTypes[endpointTypeWithDefault.toLowerCase()];
-            if (!endpointTypeToUse) {
-                throw new Error(`${endpointTypeWithDefault} is not supported endpointType, use edge or regional.`);
-            }
-            this.endpointType = endpointTypeToUse;
-
-            const apiTypeWithDefault = this.serverless.service.custom.customDomain.apiType ||
-                apiTypes.rest;
-            const apiTypeToUse = apiTypes[apiTypeWithDefault.toLowerCase()];
-            if (!apiTypeToUse) {
-                throw new Error(`${apiTypeWithDefault} is not supported api type, use REST, HTTP or WEBSOCKET.`);
-            }
-            this.apiType = apiTypeToUse;
-
-            const securityPolicyDefault = this.serverless.service.custom.customDomain.securityPolicy ||
-                tlsVersions.tls_1_2;
-            const tlsVersionToUse = tlsVersions[securityPolicyDefault.toLowerCase()];
-            if (!tlsVersionToUse) {
-                throw new Error(`${securityPolicyDefault} is not a supported securityPolicy, use tls_1_0 or tls_1_2.`);
-            }
-            this.securityPolicy = tlsVersionToUse;
-
-            this.acmRegion = this.endpointType === endpointTypes.regional ?
+            this.acmRegion = dc.endpointType === Globals.endpointTypes.regional ?
                 this.serverless.providers.aws.getRegion() : "us-east-1";
             const acmCredentials = Object.assign({}, credentials, { region: this.acmRegion });
             this.acm = new this.serverless.providers.aws.sdk.ACM(acmCredentials);
-        }
-    }
 
-    /**
-     * Determines whether this plug-in is enabled.
-     *
-     * This method reads the customDomain property "enabled" to see if this plug-in should be enabled.
-     * If the property's value is undefined, a default value of true is assumed (for backwards
-     * compatibility).
-     * If the property's value is provided, this should be boolean, otherwise an exception is thrown.
-     * If no customDomain object exists, an exception is thrown.
-     */
-    public evaluateEnabled(): boolean {
-        if (typeof this.serverless.service.custom === "undefined"
-            || typeof this.serverless.service.custom.customDomain === "undefined") {
-            throw new Error("serverless-domain-manager: Plugin configuration is missing.");
+            this.domains.push(dc);
         }
-
-        const enabled = this.serverless.service.custom.customDomain.enabled;
-        if (enabled === undefined) {
-            return true;
-        }
-        if (typeof enabled === "boolean") {
-            return enabled;
-        } else if (typeof enabled === "string" && enabled === "true") {
-            return true;
-        } else if (typeof enabled === "string" && enabled === "false") {
-            return false;
-        }
-        throw new Error(`serverless-domain-manager: Ambiguous enablement boolean: "${enabled}"`);
     }
 
     /**
      * Gets Certificate ARN that most closely matches domain name OR given Cert ARN if provided
      */
-    public async getCertArn(): Promise<string> {
-        if (this.serverless.service.custom.customDomain.certificateArn) {
-            this.serverless.cli.log(
-                `Selected specific certificateArn ${this.serverless.service.custom.customDomain.certificateArn}`);
-            return this.serverless.service.custom.customDomain.certificateArn;
+    public async getCertArn(domain: DomainConfig): Promise<string> {
+        if (domain.certificateArn) {
+            this.serverless.cli.log(`Selected specific certificateArn ${domain.certificateArn}`);
+            return domain.certificateArn;
         }
 
         let certificateArn; // The arn of the choosen certificate
-        let certificateName = this.serverless.service.custom.customDomain.certificateName; // The certificate name
+        let certificateName = domain.certificateName; // The certificate name
         let certData;
         try {
             certData = await this.acm.listCertificates(
@@ -294,7 +256,7 @@ class ServerlessCustomDomain {
                     certificateArn = foundCertificate.CertificateArn;
                 }
             } else {
-                certificateName = this.givenDomainName;
+                certificateName = domain.givenDomainName;
                 certificates.forEach((certificate) => {
                     let certificateListName = certificate.DomainName;
                     // Looks for wild card and takes it out when checking
@@ -311,7 +273,7 @@ class ServerlessCustomDomain {
                 });
             }
         } catch (err) {
-            this.logIfDebug(err);
+            this.logIfDebug(err, domain.givenDomainName);
             throw Error(`Error: Could not list certificates in Certificate Manager.\n${err}`);
         }
         if (certificateArn == null) {
@@ -321,45 +283,49 @@ class ServerlessCustomDomain {
     }
 
     /**
-     * Gets domain info as DomainInfo object if domain exists, otherwise returns false
+     * Populates the DomainInfo object on the Domains if custom domain in aws exists
      */
-    public async getDomainInfo(): Promise<DomainInfo> {
-        let domainInfo;
-        try {
-            domainInfo = await this.apigateway.getDomainName({ domainName: this.givenDomainName }).promise();
-            return new DomainInfo(domainInfo);
-        } catch (err) {
-            this.logIfDebug(err);
-            if (err.code === "NotFoundException") {
-                throw new Error(`Error: ${this.givenDomainName} not found.`);
+    public async getDomainInfo(): Promise<void> {
+        await Promise.all(this.domains.map(async (domain) => {
+            try {
+                const domainInfo = await this.apigateway.getDomainName({
+                    domainName: domain.givenDomainName,
+                }).promise();
+
+                domain.domainInfo = new DomainInfo(domainInfo);
+            } catch (err) {
+                this.logIfDebug(err, domain.givenDomainName);
+                if (err.code !== "NotFoundException") {
+                    throw new Error(`Error: Unable to fetch information about ${domain.givenDomainName}`);
+                }
             }
-            throw new Error(`Error: Unable to fetch information about ${this.givenDomainName}`);
-        }
+        }));
     }
 
     /**
      * Creates Custom Domain Name through API Gateway
      * @param certificateArn: Certificate ARN to use for custom domain
      */
-    public async createCustomDomain(certificateArn: string): Promise<DomainInfo> {
+    public async createCustomDomain(domain: DomainConfig): Promise<void> {
 
         let createdDomain = {};
 
         // Gateway API is completely different for v1 and v2 so seperating into two blocks
-        if (this.apiType === "REST") {
+        if (domain.apiType === "REST") {
             // Set up parameters
             const params = {
-                certificateArn,
-                domainName: this.givenDomainName,
+                certificateArn: domain.certificateArn,
+                domainName: domain.givenDomainName,
                 endpointConfiguration: {
-                    types: [this.endpointType],
+                    types: [domain.endpointType],
                 },
-                regionalCertificateArn: certificateArn,
-                securityPolicy: this.securityPolicy,
+                regionalCertificateArn: domain.certificateArn,
+                securityPolicy: domain.securityPolicy,
             };
-            if (this.endpointType === endpointTypes.edge) {
+
+            if (domain.endpointType === Globals.endpointTypes.edge) {
                 params.regionalCertificateArn = undefined;
-            } else if (this.endpointType === endpointTypes.regional) {
+            } else if (domain.endpointType === Globals.endpointTypes.regional) {
                 params.certificateArn = undefined;
             }
 
@@ -367,18 +333,19 @@ class ServerlessCustomDomain {
             try {
                 // If creating REST api use v1 of api gateway, else use v2 for HTTP and Websocket
                 createdDomain = await this.apigateway.createDomainName(params).promise();
+                domain.domainInfo = new DomainInfo(createdDomain);
             } catch (err) {
-                this.logIfDebug(err);
-                throw new Error(`Error: Failed to create custom domain ${this.givenDomainName}\n`);
+                this.logIfDebug(err, domain.givenDomainName);
+                throw new Error(`Error: Failed to create custom domain ${domain.givenDomainName}\n`);
             }
 
-        } else if (this.apiType === "HTTP" || this.apiType === "WEBSOCKET") {
+        } else if (domain.apiType === "HTTP" || domain.apiType === "WEBSOCKET") {
             const params = {
-                DomainName: this.givenDomainName,
+                DomainName: domain.givenDomainName,
                 DomainNameConfigurations: [{
-                    CertificateArn: certificateArn,
-                    EndpointType: this.endpointType,
-                    SecurityPolicy: this.securityPolicy,
+                    CertificateArn: domain.certificateArn,
+                    EndpointType: domain.endpointType,
+                    SecurityPolicy: domain.securityPolicy,
                 }],
             };
 
@@ -386,29 +353,28 @@ class ServerlessCustomDomain {
             try {
                 // If creating REST api use v1 of api gateway, else use v2 for HTTP and Websocket
                 createdDomain = await this.apigatewayV2.createDomainName(params).promise();
+                domain.domainInfo = new DomainInfo(createdDomain);
             } catch (err) {
-                this.logIfDebug(err);
-                throw new Error(`Error: Failed to create custom domain ${this.givenDomainName}\n`);
+                this.logIfDebug(err, domain.givenDomainName);
+                throw new Error(`Error: Failed to create custom domain ${domain.givenDomainName}\n`);
             }
         }
-
-        return new DomainInfo(createdDomain);
     }
 
     /**
      * Delete Custom Domain Name through API Gateway
      */
-    public async deleteCustomDomain(): Promise<void> {
+    public async deleteCustomDomain(domain: DomainConfig): Promise<void> {
         const params = {
-            domainName: this.givenDomainName,
+            domainName: domain.givenDomainName,
         };
 
         // Make API call
         try {
             await this.apigateway.deleteDomainName(params).promise();
         } catch (err) {
-            this.logIfDebug(err);
-            throw new Error(`Error: Failed to delete custom domain ${this.givenDomainName}\n`);
+            this.logIfDebug(err, domain.givenDomainName);
+            throw new Error(`Error: Failed to delete custom domain ${domain.givenDomainName}\n`);
         }
     }
 
@@ -417,28 +383,28 @@ class ServerlessCustomDomain {
      * @param action: String descriptor of change to be made. Valid actions are ['UPSERT', 'DELETE']
      * @param domain: DomainInfo object containing info about custom domain
      */
-    public async changeResourceRecordSet(action: string, domain: DomainInfo): Promise<void> {
+    public async changeResourceRecordSet(action: string, domain: DomainConfig): Promise<void> {
         if (action !== "UPSERT" && action !== "DELETE") {
             throw new Error(`Error: Invalid action "${action}" when changing Route53 Record.
                 Action must be either UPSERT or DELETE.\n`);
         }
 
-        const createRoute53Record = this.serverless.service.custom.customDomain.createRoute53Record;
+        const createRoute53Record = domain.createRoute53Record;
         if (createRoute53Record !== undefined && createRoute53Record === false) {
             this.serverless.cli.log("Skipping creation of Route53 record.");
             return;
         }
         // Set up parameters
-        const route53HostedZoneId = await this.getRoute53HostedZoneId();
+        const route53HostedZoneId = await this.getRoute53HostedZoneId(domain);
         const Changes = ["A", "AAAA"].map((Type) => ({
                 Action: action,
                 ResourceRecordSet: {
                     AliasTarget: {
-                        DNSName: domain.domainName,
+                        DNSName: domain.domainInfo.domainName,
                         EvaluateTargetHealth: false,
-                        HostedZoneId: domain.hostedZoneId,
+                        HostedZoneId: domain.domainInfo.hostedZoneId,
                     },
-                    Name: this.givenDomainName,
+                    Name: domain.givenDomainName,
                     Type,
                 },
         }));
@@ -453,30 +419,30 @@ class ServerlessCustomDomain {
         try {
             await this.route53.changeResourceRecordSets(params).promise();
         } catch (err) {
-            this.logIfDebug(err);
-            throw new Error(`Error: Failed to ${action} A Alias for ${this.givenDomainName}\n`);
+            this.logIfDebug(err, domain.givenDomainName);
+            throw new Error(`Error: Failed to ${action} A Alias for ${domain.givenDomainName}\n`);
         }
     }
 
     /**
      * Gets Route53 HostedZoneId from user or from AWS
      */
-    public async getRoute53HostedZoneId(): Promise<string> {
-        if (this.serverless.service.custom.customDomain.hostedZoneId) {
+    public async getRoute53HostedZoneId(domain: DomainConfig): Promise<string> {
+        if (domain.hostedZoneId) {
             this.serverless.cli.log(
                 `Selected specific hostedZoneId ${this.serverless.service.custom.customDomain.hostedZoneId}`);
-            return this.serverless.service.custom.customDomain.hostedZoneId;
+            return domain.hostedZoneId;
         }
 
-        const filterZone = this.hostedZonePrivate !== undefined;
-        if (filterZone && this.hostedZonePrivate) {
+        const filterZone = domain.hostedZonePrivate !== undefined;
+        if (filterZone && domain.hostedZonePrivate) {
             this.serverless.cli.log("Filtering to only private zones.");
-        } else if (filterZone && !this.hostedZonePrivate) {
+        } else if (filterZone && !domain.hostedZonePrivate) {
             this.serverless.cli.log("Filtering to only public zones.");
         }
 
         let hostedZoneData;
-        const givenDomainNameReverse = this.givenDomainName.split(".").reverse();
+        const givenDomainNameReverse = domain.givenDomainName.split(".").reverse();
 
         try {
             hostedZoneData = await this.route53.listHostedZones({}).promise();
@@ -488,7 +454,7 @@ class ServerlessCustomDomain {
                     } else {
                         hostedZoneName = hostedZone.Name;
                     }
-                    if (!filterZone || this.hostedZonePrivate === hostedZone.Config.PrivateZone) {
+                    if (!filterZone || domain.hostedZonePrivate === hostedZone.Config.PrivateZone) {
                         const hostedZoneNameReverse = hostedZoneName.split(".").reverse();
 
                         if (givenDomainNameReverse.length === 1
@@ -514,29 +480,29 @@ class ServerlessCustomDomain {
                 return hostedZoneId.substring(startPos, endPos);
             }
         } catch (err) {
-            this.logIfDebug(err);
+            this.logIfDebug(err, domain.givenDomainName);
             throw new Error(`Error: Unable to list hosted zones in Route53.\n${err}`);
         }
-        throw new Error(`Error: Could not find hosted zone "${this.givenDomainName}"`);
+        throw new Error(`Error: Could not find hosted zone "${domain.givenDomainName}"`);
     }
 
-    public async getBasePathMapping(restApiId: string): Promise<string> {
+    public async getBasePathMapping(domain: DomainConfig): Promise<string> {
         let basepathInfo;
         let currentBasePath;
 
-        if (this.apiType === "REST") {
+        if (domain.apiType === "REST") {
             const params = {
-                domainName: this.givenDomainName,
+                domainName: domain.givenDomainName,
             };
             try {
                 basepathInfo = await this.apigateway.getBasePathMappings(params).promise();
             } catch (err) {
-                this.logIfDebug(err);
-                throw new Error(`Error: Unable to get BasePathMappings for ${this.givenDomainName}`);
+                this.logIfDebug(err, domain.givenDomainName);
+                throw new Error(`Error: Unable to get BasePathMappings for ${domain.givenDomainName}`);
             }
             if (basepathInfo.items !== undefined && basepathInfo.items instanceof Array) {
                 for (const basepathObj of basepathInfo.items) {
-                    if (basepathObj.restApiId === restApiId) {
+                    if (basepathObj.restApiId === domain.apiId) {
                         currentBasePath = basepathObj.basePath;
                         break;
                     }
@@ -544,19 +510,19 @@ class ServerlessCustomDomain {
             }
             return currentBasePath;
 
-        } else if (this.apiType === "HTTP" || this.apiType === "WEBSOCKET") { // V2 HTTP and WEBSOCKET
+        } else if (domain.apiType === "HTTP" || domain.apiType === "WEBSOCKET") { // V2 HTTP and WEBSOCKET
             const params = {
-                DomainName: this.givenDomainName,
+                DomainName: domain.givenDomainName,
             };
             try {
                 basepathInfo = await this.apigatewayV2.getApiMappings(params).promise();
             } catch (err) {
-                this.logIfDebug(err);
-                throw new Error(`Error: Unable to get BasePathMappings for ${this.givenDomainName}`);
+                this.logIfDebug(err, domain.givenDomainName);
+                throw new Error(`Error: Unable to get BasePathMappings for ${domain.givenDomainName}`);
             }
             if (basepathInfo.Items !== undefined && basepathInfo.Items instanceof Array) {
                 for (const basepathObj of basepathInfo.Items) {
-                    if (basepathObj.ApiId === restApiId) {
+                    if (basepathObj.ApiId === domain.apiId) {
                         currentBasePath = basepathObj.ApiMappingKey;
                         break;
                     }
@@ -569,36 +535,36 @@ class ServerlessCustomDomain {
     /**
      * Creates basepath mapping
      */
-    public async createBasePathMapping(restApiId: string): Promise<void> {
-        if (this.apiType === "REST") {
+    public async createBasePathMapping(domain: DomainConfig): Promise<void> {
+        if (domain.apiType === "REST") {
             const params = {
-                basePath: this.basePath,
-                domainName: this.givenDomainName,
-                restApiId,
-                stage: this.stage,
+                basePath: domain.basePath,
+                domainName: domain.givenDomainName,
+                restApiId: domain.apiId,
+                stage: domain.stage,
             };
             // Make API call
             try {
                 await this.apigateway.createBasePathMapping(params).promise();
                 this.serverless.cli.log("Created basepath mapping.");
             } catch (err) {
-                this.logIfDebug(err);
+                this.logIfDebug(err, domain.givenDomainName);
                 throw new Error(`Error: Unable to create basepath mapping.\n`);
             }
 
-        } else if (this.apiType === "HTTP" || this.apiType === "WEBSOCKET") { // V2 HTTP and WEBSOCKET
+        } else if (domain.apiType === "HTTP" || domain.apiType === "WEBSOCKET") { // V2 HTTP and WEBSOCKET
             const params = {
-                ApiId: restApiId,
-                ApiMappingKey: this.basePath,
-                DomainName: this.givenDomainName,
-                Stage: this.apiType === "HTTP" ? '$default': this.stage,
+                ApiId: domain.apiId,
+                ApiMappingKey: domain.basePath,
+                DomainName: domain.givenDomainName,
+                Stage: domain.apiType === "HTTP" ? "$default" : domain.stage,
             };
             // Make API call
             try {
                 await this.apigatewayV2.createApiMapping(params).promise();
                 this.serverless.cli.log("Created basepath mapping.");
             } catch (err) {
-                this.logIfDebug(err);
+                this.logIfDebug(err, domain.givenDomainName);
                 throw new Error(`Error: Unable to create basepath mapping.\n`);
             }
         }
@@ -607,15 +573,15 @@ class ServerlessCustomDomain {
     /**
      * Updates basepath mapping
      */
-    public async updateBasePathMapping(oldBasePath: string): Promise<void> {
+    public async updateBasePathMapping(domain: DomainConfig): Promise<void> {
         const params = {
-            basePath: oldBasePath,
-            domainName: this.givenDomainName,
+            basePath: domain.currentBasePath,
+            domainName: domain.givenDomainName,
             patchOperations: [
                 {
                     op: "replace",
                     path: "/basePath",
-                    value: this.basePath,
+                    value: domain.basePath,
                 },
             ],
         };
@@ -624,7 +590,7 @@ class ServerlessCustomDomain {
             await this.apigateway.updateBasePathMapping(params).promise();
             this.serverless.cli.log("Updated basepath mapping.");
         } catch (err) {
-            this.logIfDebug(err);
+            this.logIfDebug(err, domain.givenDomainName);
             throw new Error(`Error: Unable to update basepath mapping.\n`);
         }
     }
@@ -632,7 +598,7 @@ class ServerlessCustomDomain {
     /**
      * Gets rest API id from CloudFormation stack
      */
-    public async getApiId(): Promise<string> {
+    public async getApiId(domain: DomainConfig): Promise<string> {
         if (this.serverless.service.provider.apiGateway && this.serverless.service.provider.apiGateway.restApiId) {
             this.serverless.cli.log(`Mapping custom domain to existing API
                 ${this.serverless.service.provider.apiGateway.restApiId}.`);
@@ -640,12 +606,12 @@ class ServerlessCustomDomain {
         }
 
         const stackName = this.serverless.service.provider.stackName ||
-            `${this.serverless.service.service}-${this.stage}`;
+            `${this.serverless.service.service}-${domain.stage}`;
 
         let LogicalResourceId = "ApiGatewayRestApi";
-        if (this.apiType === "HTTP") {
+        if (domain.apiType === "HTTP") {
             LogicalResourceId = "HttpApi";
-        } else if (this.apiType === "WEBSOCKET") {
+        } else if (domain.apiType === "WEBSOCKET") {
             LogicalResourceId = "WebsocketsApi";
         }
 
@@ -658,8 +624,8 @@ class ServerlessCustomDomain {
         try {
             response = await this.cloudformation.describeStackResource(params).promise();
         } catch (err) {
-            this.logIfDebug(err);
-            throw new Error(`Error: Failed to find CloudFormation resources for ${this.givenDomainName}\n`);
+            this.logIfDebug(err, domain.givenDomainName);
+            throw new Error(`Error: Failed to find CloudFormation resources for ${domain.givenDomainName}\n`);
         }
 
         const apiId = response.StackResourceDetail.PhysicalResourceId;
@@ -672,35 +638,37 @@ class ServerlessCustomDomain {
     /**
      * Deletes basepath mapping
      */
-    public async deleteBasePathMapping(): Promise<void> {
+    public async deleteBasePathMapping(domain: DomainConfig): Promise<void> {
         const params = {
-            basePath: this.basePath,
-            domainName: this.givenDomainName,
+            basePath: domain.basePath,
+            domainName: domain.givenDomainName,
         };
         // Make API call
         try {
             await this.apigateway.deleteBasePathMapping(params).promise();
             this.serverless.cli.log("Removed basepath mapping.");
         } catch (err) {
-            this.logIfDebug(err);
-            this.serverless.cli.log("Unable to remove basepath mapping.");
+            this.logIfDebug(err, domain.givenDomainName);
+            this.serverless.cli.log(`Unable to remove basepath mapping for ${domain.givenDomainName}`);
         }
     }
 
     /**
      *  Adds the domain name and distribution domain name to the CloudFormation outputs
      */
-    public addOutputs(domainInfo: DomainInfo): void {
+    // public addOutputs(domainInfo: DomainInfo): void {
+
+    public addOutputs(domain: DomainConfig): void {
         const service = this.serverless.service;
         if (!service.provider.compiledCloudFormationTemplate.Outputs) {
             service.provider.compiledCloudFormationTemplate.Outputs = {};
         }
         service.provider.compiledCloudFormationTemplate.Outputs.DomainName = {
-            Value: domainInfo.domainName,
+            Value: domain.domainInfo.domainName,
         };
-        if (domainInfo.hostedZoneId) {
+        if (domain.domainInfo.hostedZoneId) {
             service.provider.compiledCloudFormationTemplate.Outputs.HostedZoneId = {
-                Value: domainInfo.hostedZoneId,
+                Value: domain.domainInfo.hostedZoneId,
             };
         }
     }
@@ -709,26 +677,26 @@ class ServerlessCustomDomain {
      * Logs message if SLS_DEBUG is set
      * @param message message to be printed
      */
-    public logIfDebug(message: any): void {
-        if (process.env.SLS_DEBUG) {
-            this.serverless.cli.log(message, "Serverless Domain Manager");
+    public logIfDebug(message: any, domain: string): void {
+        if (process.env.SLS_DEBUG || true) {
+            this.serverless.cli.log(`${domain ? domain + ": " : ""} ${message}`, "Serverless Domain Manager");
         }
     }
 
     /**
      * Prints out a summary of all domain manager related info
      */
-    private printDomainSummary(domainInfo: DomainInfo): void {
+    private printDomainSummary(domain: DomainConfig): void {
         this.serverless.cli.consoleLog(chalk.yellow.underline("Serverless Domain Manager Summary"));
 
-        if (this.serverless.service.custom.customDomain.createRoute53Record !== false) {
+        if (domain.createRoute53Record !== false) {
             this.serverless.cli.consoleLog(chalk.yellow("Domain Name"));
-            this.serverless.cli.consoleLog(`  ${this.givenDomainName}`);
+            this.serverless.cli.consoleLog(`  ${domain.givenDomainName}`);
         }
 
         this.serverless.cli.consoleLog(chalk.yellow("Distribution Domain Name"));
-        this.serverless.cli.consoleLog(`  Target Domain: ${domainInfo.domainName}`);
-        this.serverless.cli.consoleLog(`  Hosted Zone Id: ${domainInfo.hostedZoneId}`);
+        this.serverless.cli.consoleLog(`  Target Domain: ${domain.domainInfo.domainName}`);
+        this.serverless.cli.consoleLog(`  Hosted Zone Id: ${domain.domainInfo.hostedZoneId}`);
     }
 }
 
